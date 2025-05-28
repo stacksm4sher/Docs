@@ -422,4 +422,264 @@ also we can randomize hooking by picking random technique: mov rax, call rax; pu
 
 ## Advanced hooking. Code Caves (Second method)
 
+Code caves are just some sequence of `int3` or `nop` instructions in a procedure
+
+We will use such assembly code for our hook injection
+
+```nasm
+.code
+
+Foo proc
+	push rbx
+	push rcx
+	push rdx
+
+	push rbp
+	mov rbp, rsp
+	sub rsp, 28h
+
+	mov rax, 1h
+	mov rbx, 8h
+	sub rbx, rax
+	mov rax, rbx
+
+	nop				; That's where code cave starts
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+
+	mov rsp, rbp
+	pop rbp
+	
+	pop rdx
+	pop rcx
+	pop rbx
+
+	ret
+Foo endp
+
+end
+```
+
+Lets code our implementation for finding code caves
+
+```cpp
+// Finding epilogue offset to make sure we are not out of right procedure
+ULONG_PTR FindEpilogueOffset(PVOID target)
+{
+	ZydisDecoder decoder;
+	ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+
+	ULONG_PTR scanFunction = (ULONG_PTR)target;
+	BOOL bEpilogueReached = FALSE;
+	ULONG_PTR epilogueStartOffset = NULL;
+	while (!bEpilogueReached)
+	{
+		ZydisDecodedInstruction* instruction = new ZydisDecodedInstruction;
+		ZydisDecodedOperand* operands = new ZydisDecodedOperand[ZYDIS_MAX_OPERAND_COUNT]{ 0 };
+		ZyanStatus status = ZydisDecoderDecodeFull(&decoder, (PVOID)scanFunction, 15, instruction, operands);
+
+		if (!ZYAN_SUCCESS(status))
+		{
+			printf("Failed to decode instruction at %p\n", scanFunction);
+			break;
+		}
+
+		ULONG32 operationType = DetermineStackOperationType(instruction, operands);
+
+		if (operationType == ADD_RSP_TYPE || operationType == MOV_RSP_RBP_TYPE)
+		{
+			epilogueStartOffset = scanFunction - (ULONG_PTR)target;
+			bEpilogueReached = TRUE;
+		}
+
+		scanFunction = scanFunction + instruction->length;
+		delete instruction;
+		delete[] operands;
+	}
+	return epilogueStartOffset;
+}
+
+/*
+* Simply scanning whole procedure for int3 or nop sequences
+* Returning 0 if suitable code cave was not found
+*/
+HOOKAPI ULONG_PTR ScanFunctionForCodeCave(PVOID target, ULONG64 expectedCodeCaveSize)
+{
+	ULONG_PTR epilogueOffset = FindEpilogueOffset(target);
+
+	DWORD oldProtect;
+	VirtualProtect(target, epilogueOffset, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+	ULONG64 currentCodeCaveSize = NULL;
+	ULONG32 currentIdx = NULL;
+	while (currentIdx != epilogueOffset)
+	{
+		BYTE opcode = ((BYTE*)target)[currentIdx++];
+		if (opcode == INT3 || opcode == NOP)
+		{
+			currentCodeCaveSize++;
+			if (currentCodeCaveSize == expectedCodeCaveSize)
+			{
+				return currentIdx - expectedCodeCaveSize;
+			}
+		}
+		else {
+			if (currentCodeCaveSize == expectedCodeCaveSize)
+			{
+				return currentIdx - expectedCodeCaveSize;
+			}
+			currentCodeCaveSize = NULL;
+		}
+	}
+
+	VirtualProtect(target, epilogueOffset, oldProtect, &oldProtect);
+
+	return NULL;
+}
+```
+
+Now let's test it! Our goal is to find code cave with size of 7 and replace this 7 `nop`s with `mov rax, 1`,
+so Foo will return 1
+
+```cpp
+int main()
+{
+	ULONG_PTR scanFunc = (ULONG_PTR)Foo;
+
+	FUNCTION_INFO fi = ScanFunctionForSafeInstructions((PVOID)scanFunc);
+
+	ULONG_PTR prologueEndOffset = fi.PrologueEndOffset;
+	ULONG_PTR epilogueStartOffset = fi.EpilogueStartOffset;
+	PSAFE_INSTRUCTION safeInstructions = fi.SafeInstuctions;
+	ULONG64 safeInstructionsSize = fi.SafeInstructionsSize;
+
+	printf("[+] Original function info: \n\n");
+	printf("[+] Function address: %p\n", Foo);
+	printf("[+] Prologue end address: %p\n", prologueEndOffset);
+	printf("[+] Epilogue start address: %p\n", epilogueStartOffset);
+	printf("[+] Safe instructions(found %d): \n", safeInstructionsSize);
+	for (ULONG64 i = 0; i < safeInstructionsSize; i++)
+	{
+		SAFE_INSTRUCTION instruction = safeInstructions[i];
+		printf("\t[+] Safe instruction #%d address: %p, length: %d\n", i, instruction.SafeInstructionOffset, instruction.SafeInstructionLength);
+	}
+	printf("\t[+] Total safe instructions length: %d\n", fi.CalculateTotalSafeInstructionsLength());
+
+	ULONG_PTR codeCaveOffset = ScanFunctionForCodeCave(Foo, 7);
+	printf("[+] Code cave found at offset %p\n", codeCaveOffset);
+
+	printf("[+] Foo address: %p, Code cave offset: %p, Final address: %p\n", Foo, codeCaveOffset, (PVOID)((ULONG_PTR)Foo + codeCaveOffset));
+
+	ULONG64 originalReturnValue = Foo();
+	printf("\n[+] Original function return value: %d\n", originalReturnValue);
+
+	const BYTE MOV_RAX_1[7] = { 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00 };
+
+	DWORD oldProtect;
+	VirtualProtect((PVOID)((ULONG_PTR)Foo + codeCaveOffset), sizeof(MOV_RAX_1), PAGE_EXECUTE_READWRITE, &oldProtect);
+	memcpy((PVOID)((ULONG_PTR)Foo + codeCaveOffset), MOV_RAX_1, sizeof(MOV_RAX_1));
+	VirtualProtect((PVOID)((ULONG_PTR)Foo + codeCaveOffset), sizeof(MOV_RAX_1), oldProtect, &oldProtect);
+
+	ULONG_PTR scanHookFunc = (ULONG_PTR)Foo;
+
+	FUNCTION_INFO hfi = ScanFunctionForSafeInstructions((PVOID)scanHookFunc);
+
+	ULONG_PTR hPrologueEndOffset = hfi.PrologueEndOffset;
+	ULONG_PTR hEpilogueStartOffset = hfi.EpilogueStartOffset;
+	PSAFE_INSTRUCTION hSafeInstructions = hfi.SafeInstuctions;
+	ULONG64 hSafeInstructionsSize = hfi.SafeInstructionsSize;
+
+    printf("\n-----------------------------------------------------------------------\n\n");
+	printf("\n[+] Hooked function info: \n\n");
+	printf("[+] Function address: %p\n", Foo);
+	printf("[+] Prologue end address: %p\n", hPrologueEndOffset);
+	printf("[+] Epilogue start address: %p\n", hEpilogueStartOffset);
+	printf("[+] Safe instructions(found %d): \n", hSafeInstructionsSize);
+	for (ULONG64 i = 0; i < hSafeInstructionsSize; i++)
+	{
+		SAFE_INSTRUCTION instruction = hSafeInstructions[i];
+		printf("\t[+] Safe instruction #%d address: %p, length: %d\n", i, instruction.SafeInstructionOffset, instruction.SafeInstructionLength);
+	}
+	printf("\t[+] Total safe instructions length: %d\n", hfi.CalculateTotalSafeInstructionsLength());
+
+	ULONG_PTR hCodeCaveOffset = ScanFunctionForCodeCave(Foo, 7);
+	printf("[+] Code cave found at offset %p\n", hCodeCaveOffset);
+
+	ULONG64 hookedReturnValue = Foo();
+	printf("\n[+] Hooked function return value: %d", hookedReturnValue);
+}
+```
+
+And here is the console output:
+
+```text
+[+] Original function info:
+
+[+] Function address: 00007FF6289A1370
+[+] Prologue end address: 000000000000000B
+[+] Epilogue start address: 0000000000000026
+[+] Safe instructions(found 11):
+        [+] Safe instruction #0 address: 000000000000000B, length: 7
+        [+] Safe instruction #1 address: 0000000000000012, length: 7
+        [+] Safe instruction #2 address: 0000000000000019, length: 3
+        [+] Safe instruction #3 address: 000000000000001C, length: 3
+        [+] Safe instruction #4 address: 000000000000001F, length: 1
+        [+] Safe instruction #5 address: 0000000000000020, length: 1
+        [+] Safe instruction #6 address: 0000000000000021, length: 1
+        [+] Safe instruction #7 address: 0000000000000022, length: 1
+        [+] Safe instruction #8 address: 0000000000000023, length: 1
+        [+] Safe instruction #9 address: 0000000000000024, length: 1
+        [+] Safe instruction #10 address: 0000000000000025, length: 1
+        [+] Total safe instructions length: 27
+[+] Code cave found at offset 000000000000001F
+
+[+] Original function return value: 7
+
+-----------------------------------------------------------------------
+
+[+] Hooked function info:
+
+[+] Function address: 00007FF6289A1370
+[+] Prologue end address: 000000000000000B
+[+] Epilogue start address: 0000000000000026
+[+] Safe instructions(found 5):
+        [+] Safe instruction #0 address: 000000000000000B, length: 7
+        [+] Safe instruction #1 address: 0000000000000012, length: 7
+        [+] Safe instruction #2 address: 0000000000000019, length: 3
+        [+] Safe instruction #3 address: 000000000000001C, length: 3
+        [+] Safe instruction #4 address: 000000000000001F, length: 7
+        [+] Total safe instructions length: 27
+[+] Code cave found at offset 0000000000000000 - Which means there are no more code caves
+
+[+] Hooked function return value: 1
+```
+
+## Security measures against anti-cheats
+
+In this topic we will talk about security measures and how to avoid detection when hooking functions.
+
+### Bait instructions before real malicious code
+
+WIP
+
+### Timing based detection
+
+WIP
+
+### Randomizing
+
+WIP
+
+## Additional info
+
+### Restoring original function
+
+WIP
+
+### Detouring after hook excecution
+
 WIP
